@@ -534,6 +534,7 @@ import {
     exists,
     remove,
     writeFile,
+    rename,
 } from '@tauri-apps/plugin-fs'
 import {
     appCacheDir,
@@ -586,6 +587,7 @@ import {
     readStaticFile,
     rhExeUrl,
     base64PngToIco,
+    isAlphanumeric,
 } from '@/utils/common'
 import { arch, platform } from '@tauri-apps/plugin-os'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -615,8 +617,8 @@ const configDialogVisible = ref(false)
 const codeDialogVisible = ref(false)
 const imgPreviewVisible = ref(false)
 const warning = ref('')
-const platformName = platform()
-const archName = arch()
+const platformName = isTauri ? platform() : 'web'
+const archName = isTauri ? arch() : 'web'
 
 const appRules = reactive<FormRules>({
     showName: [
@@ -732,6 +734,7 @@ const methodOptions = [
     {
         value: 'local',
         label: '本地打包（仅支持本机系统，大概36秒）',
+        disabled: !isTauri,
     },
     {
         value: 'cloud',
@@ -761,7 +764,6 @@ const platformMap: any = {
 
 // method change
 const methodChange = (value: string) => {
-    console.log('methodChange', value, platformName, archName)
     if (value === 'local') {
         // 判断本机型号，然后给store.currentProject.platform复制
         store.currentProject.platform = platformMap[platformName + archName]
@@ -1087,7 +1089,7 @@ const stopServer = async () => {
     }
 }
 // close preview window and stop server
-listen('stop_server', stopServer)
+isTauri && listen('stop_server', stopServer)
 
 // handle file change
 const handleFileChange = async (event: any) => {
@@ -1565,9 +1567,10 @@ const updateCustomJs = async () => {
     }
 }
 
-listen('local-progress', (event: any) => {
-    buildRate.value = parseInt(event.payload)
-})
+isTauri &&
+    listen('local-progress', (event: any) => {
+        buildRate.value = parseInt(event.payload)
+    })
 
 // local publish
 const easyLocal = async () => {
@@ -1589,43 +1592,66 @@ const easyLocal = async () => {
         loadingText(loadingState)
     }, 1000)
     // if windows, down rh.exe
+    // exe name
+    let targetName = isAlphanumeric(store.currentProject.showName)
+        ? store.currentProject.showName
+        : store.currentProject.name
+    const targetExe = await join(targetDir, targetName, `${targetName}.exe`)
     if (platformName === 'windows') {
         const ppExeDir: string = await invoke('get_exe_dir')
         const rhExePath = await join(ppExeDir, 'data', 'rh.exe')
-        const downRhExe = await invoke('download_file', {
-            url: rhExeUrl,
-            savePath: rhExePath,
-            fileId: 'rh.exe',
-        })
-        console.log('downRhExe----', downRhExe)
+        // exists
+        if (await exists(rhExePath)) {
+            console.log('rh.exe exists')
+        } else {
+            await invoke('download_file', {
+                url: rhExeUrl,
+                savePath: rhExePath,
+                fileId: 'rh.exe',
+            })
+        }
         // ico save to local
         const base64String = store.currentProject.iconRound
             ? roundIcon.value
             : iconBase64.value
         const icoBlob = await base64PngToIco(base64String)
-        console.log('ico', icoBlob)
         const icoPath = await join(ppExeDir, 'data', 'app.ico')
         await writeFile(icoPath, icoBlob)
+        // save rhscript.txt
+        const rhscript = await readStaticFile('rhscript.txt')
+        const rhtarget = rhscript.replace('Target.exe', targetExe)
+        const rhscriptPath = await join(ppExeDir, 'data', 'rhscript.txt')
+        await writeTextFile(rhscriptPath, rhtarget)
+    } else {
+        targetName = store.currentProject.showName
     }
     // build local
     // store.currentProject.isHtml && store.currentProject.htmlPath
     invoke('build_local', {
         targetDir: targetDir,
-        exeName: store.currentProject.showName,
+        exeName: targetName,
         config: store.currentProject.more.windows,
-        base64Png:
-            platformName === 'macos'
-                ? store.currentProject.iconRound
-                    ? roundIcon.value
-                    : iconBase64.value
-                : iconBase64.value,
+        base64Png: store.currentProject.iconRound
+            ? roundIcon.value
+            : iconBase64.value,
         debug: store.currentProject.desktop.debug,
         customJs: await getInitializationScript(true),
         htmlPath: store.currentProject.htmlPath,
     })
-        .then((res) => {
-            console.log('build_local1 res', res)
+        .then(async (res) => {
             loadingText(t('buildSuccess'))
+            // isAlphanumeric(store.currentProject.showName)
+            if (
+                platformName === 'windows' &&
+                !isAlphanumeric(store.currentProject.showName)
+            ) {
+                const chinaExeName = await join(
+                    targetDir,
+                    targetName,
+                    `${store.currentProject.showName}.exe`
+                )
+                await rename(targetExe, chinaExeName)
+            }
             oneMessage.success('本地打包成功')
             buildLoading.value = false
         })
@@ -1752,7 +1778,7 @@ const dispatchAction = async () => {
             buildTime += 1
             const minute = Math.floor(buildTime / 60)
             const second = buildTime % 60
-            const buildRate = Math.floor((buildTime / (60 * 15)) * 100)
+            const buildRate = Math.floor((buildTime / (60 * 10)) * 100)
             // loadingText.value = `${buildStatus}...${minute}分${second}秒`
             const loadingState = `<div>${minute}${t('minute')}${second}${t(
                 'second'
@@ -1938,6 +1964,9 @@ onMounted(async () => {
         const window = getCurrentWindow()
         window.setTitle(`${store.currentProject.name}`)
         methodChange(store.currentProject.desktop.buildMethod)
+    } else {
+        store.currentProject.desktop.buildMethod = 'cloud'
+        methodChange('cloud')
     }
     console.log('route.query', route.query)
     const delrelease = route.query.delrelease
